@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 from __future__ import annotations
-
+import gymnasium as gym
 import math
 import torch
 from collections.abc import Sequence
@@ -23,7 +23,10 @@ class Go2DirectProjectEnv(DirectRLEnv):
 
     def __init__(self, cfg: Go2DirectProjectEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
-        
+        self._actions = torch.zeros(self.num_envs, gym.spaces.flatdim(self.single_action_space), device=self.device)
+        self._previous_actions = torch.zeros(
+            self.num_envs, gym.spaces.flatdim(self.single_action_space), device=self.device
+        )
         self._dog_dof_idx, _ = self.robot.find_joints(self.cfg.dog_dof_name)
         self._dt1_dof_idx, _ = self.robot.find_joints(self.cfg.dt1_dof_name)
         self._all_joints_idx, _ = self.robot.find_joints(self.cfg.all_dof_name)
@@ -43,7 +46,7 @@ class Go2DirectProjectEnv(DirectRLEnv):
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot_cfg)
         # add ground plane
-        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
+        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg(size=(182, 182)))
         # clone and replicate
         self.scene.clone_environments(copy_from_source=False)
         # add articulation to scene
@@ -53,22 +56,21 @@ class Go2DirectProjectEnv(DirectRLEnv):
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        self.actions = actions.clone()
+        self._actions = actions.clone()
+        self._processed_actions = self.cfg.action_scale * self._actions + self.robot.data.default_joint_pos
 
     def _apply_action(self) -> None:
-        # print(self.actions, "===================", sep='\n')
-        # # self.robot.set_joint_effort_target(self.actions * self.cfg.action_scale, joint_ids=self._all_joints_idx)
-        # print(self.actions)
-        self.robot.set_joint_position_target(self.actions * self.cfg.action_space, joint_ids=self._all_joints_idx)
-        # self.robot.set_joint_effort_target(self.actions * self.cfg.action_scale, joint_ids=self._dog_dof_idx)
+        self.robot.set_joint_position_target(self._processed_actions)
 
     def _get_observations(self) -> dict:
+        self._previous_actions = self._actions.clone()
         obs = torch.cat(
             (
                 self.joint_pos[:, self._dog_dof_idx[0]].unsqueeze(dim=1),
                 self.joint_vel[:, self._dog_dof_idx[0]].unsqueeze(dim=1),
                 self.joint_pos[:, self._dt1_dof_idx[0]].unsqueeze(dim=1),
                 self.joint_vel[:, self._dt1_dof_idx[0]].unsqueeze(dim=1),
+                self.actions,
             ),
             dim=-1,
         )
@@ -76,7 +78,8 @@ class Go2DirectProjectEnv(DirectRLEnv):
         return observations
 
     def _get_rewards(self) -> torch.Tensor:
-        total_reward, rew_alive, rew_termination, rew_pole_pos, rew_cart_vel, rew_pole_vel = compute_rewards(
+        total_reward, rew_alive, rew_termination, rew_dog_pos, rew_dt1_vel, rew_dt1_pos = compute_rewards(
+            # rew_pole_pos,
             self.cfg.rew_scale_alive,
             self.cfg.rew_scale_terminated,
             self.cfg.rew_scale_dog_pos,
@@ -85,14 +88,16 @@ class Go2DirectProjectEnv(DirectRLEnv):
             self.joint_pos[:, self._dog_dof_idx[0]],
             self.joint_pos[:, self._dt1_dof_idx[0]],
             self.joint_vel[:, self._dt1_dof_idx[0]],
+            self.cfg.target_pos,
+            self.cfg.target_vel,
             self.reset_terminated,
         )
         rew_dict = {
             'rew_alive': rew_alive,
             'rew_termination': rew_termination,
-            'rew_dog_pos': rew_pole_pos,
-            'rew_dt1_vel': rew_cart_vel,
-            'rew_dt1_pos': rew_pole_vel,
+            'rew_dog_pos': rew_dog_pos,
+            'rew_dt1_vel': rew_dt1_vel,
+            'rew_dt1_pos': rew_dt1_pos,
         }
 
         for key, value in rew_dict.items():
@@ -105,17 +110,23 @@ class Go2DirectProjectEnv(DirectRLEnv):
 
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         out_of_bounds = torch.any(torch.abs(self.joint_pos[:, self._dog_dof_idx]) > self.cfg.target_pos, dim=1)
-        out_of_bounds = out_of_bounds | torch.any(torch.abs(self.joint_pos[:, self._dt1_dof_idx]) > self.cfg.target_pos, dim=1)
+        out_of_bounds = torch.any(torch.abs(self.joint_vel[:, self._dt1_dof_idx]) > self.cfg.target_vel, dim=1)
         return out_of_bounds, time_out
 
-    def _reset_idx(self, env_ids: Sequence[int] | None):
+    def _reset_idx(self, env_ids: Sequence[int]):
         if env_ids is None:
             env_ids = self.robot._ALL_INDICES
+        self.robot.reset(env_ids)
         super()._reset_idx(env_ids)
-
+        if len(env_ids) == self.num_envs:
+            # Spread out the resets to avoid spikes in training when many environments reset at a similar time
+            self.episode_length_buf[:] = torch.randint_like(self.episode_length_buf, high=int(self.max_episode_length))
+        self.actions[env_ids] = 0.0
+        self._previous_actions[env_ids] = 0.0
+        
         joint_pos = self.robot.data.default_joint_pos[env_ids]
         joint_pos[:, self._dog_dof_idx] += sample_uniform(
-            self.cfg.initial_angle_range[0] * math.pi, 
+            self.cfg.initial_angle_range[0] * math.pi,
             self.cfg.initial_angle_range[1] * math.pi,
             joint_pos[:, self._dog_dof_idx].shape,
             str(joint_pos.device),
@@ -156,12 +167,17 @@ def compute_rewards(
     dog_pos: torch.Tensor,
     dt1_vel: torch.Tensor,
     dt1_pos: torch.Tensor,
+    target_pos: float,
+    target_vel: float,
     reset_terminated: torch.Tensor,
 ):
     rew_alive = rew_scale_alive * (1.0 - reset_terminated.float())
     rew_termination = rew_scale_terminated * reset_terminated.float()
-    rew_dog_pos = rew_scale_dog_pos * torch.sum(torch.square(dog_pos).unsqueeze(dim=1), dim=-1)
-    rew_dt1_vel = rew_scale_dt1_vel * torch.sum(torch.abs(dt1_vel).unsqueeze(dim=1), dim=-1)
-    rew_dt1_pos = rew_scale_dt1_pos * torch.sum(torch.square(dt1_pos).unsqueeze(dim=1), dim=-1)
-    total_reward = rew_alive + rew_termination + rew_dog_pos + rew_dt1_vel + rew_dt1_pos
-    return total_reward, rew_alive, rew_termination, rew_dog_pos, rew_dt1_vel, rew_dt1_pos
+    rew_dog_pos = rew_scale_dog_pos * torch.sum(torch.square(target_pos - dog_pos).unsqueeze(dim=1), dim=-1)
+    rew_dt1_vel = rew_scale_dt1_vel * torch.sum(torch.abs(target_vel - dt1_vel).unsqueeze(dim=1), dim=-1)
+    rew_dt1_pos = rew_scale_dt1_pos * torch.sum(torch.square(target_pos - dt1_pos).unsqueeze(dim=1), dim=-1)
+    total_reward = (rew_alive + rew_termination + rew_dt1_vel + rew_dt1_pos)
+    return (total_reward, rew_alive, rew_termination,
+            rew_dog_pos,
+            rew_dt1_vel, rew_dt1_pos)
+    

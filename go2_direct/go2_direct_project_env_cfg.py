@@ -41,7 +41,7 @@ class Go2DirectProjectEnvCfg(DirectRLEnvCfg):
     robot_cfg.prim_path = '/World/envs/env_.*/Robot'
 
     # scene
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=4.0, replicate_physics=True)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=2.0, replicate_physics=True)
 
     # custom parameters/scales
     # - controllable joint
@@ -53,23 +53,12 @@ class Go2DirectProjectEnvCfg(DirectRLEnvCfg):
     # - reward scales
     rew_scale_alive = .1
     rew_scale_terminated = -.2
-    rew_scale_dog_pos = -.1
+    rew_scale_dog_pos = .1
     rew_scale_dt1_vel = -.1
     rew_scale_dt1_pos = -.1
-    # rew_dog_joints_pos = -1.
 
     # - reset states/conditions
     initial_angle_range = [-0.25, 0.25]  # pole angle sample range on reset [rad]
     target_pos = 0  # reset if cart exceeds this position [m]
-    # rew_scale_RL_hip = -1.
-    # rew_scale_RL_thigh = -1.
-    # rew_scale_RL_calf = -1.
-    # rew_scale_RR_hip = -1.
-    # rew_scale_RR_thigh = -1.
-    # rew_scale_RR_calf = -1.
-    # rew_scale_FL_hip = 0.19, 0.046
-    # rew_scale_FL_thigh = -1.
-    # rew_scale_FL_calf = -1.
-    # rew_scale_FR_hip = -1.
-    # rew_scale_FR_thigh = -1.
-    # rew_scale_FR_calf = -1.
+    target_vel = 23
+
